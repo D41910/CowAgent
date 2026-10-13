@@ -40,6 +40,35 @@ def _extract_filename(content_disposition: str) -> str:
     return m.group(1).strip() if m else ""
 
 
+def _unique_save_path(media_id: str, filename: str) -> str:
+    """Return a per-attachment path under the tmp dir.
+
+    The sender picks ``filename``, so two attachments in one conversation can
+    arrive with the same name. Without a per-message prefix the second
+    download overwrites the first, and ``FileCache`` then de-duplicates their
+    identical paths, so the agent only ever sees one of the files. Prefix the
+    media id -- unique per message -- the way telegram prefixes its ``file_id``
+    and weixin prefixes a UUID since #3635. The prefix counts against a
+    255-byte UTF-8 filename budget; an over-long stem is truncated at a
+    codepoint boundary while its extension is preserved when it fits.
+    """
+    name = safe_filename(filename)
+    if not name:
+        # No usable name: the media id alone is already unique.
+        return os.path.join(_get_tmp_dir(), media_id)
+    prefix = f"{media_id}_" if media_id else ""
+    budget = 255 - len(prefix.encode("utf-8"))
+    if len(name.encode("utf-8")) > budget:
+        stem, ext = os.path.splitext(name)
+        if len(ext.encode("utf-8")) > budget:
+            stem, ext = name, ""
+        stem = stem.encode("utf-8")[: budget - len(ext.encode("utf-8"))].decode(
+            "utf-8", errors="ignore"
+        )
+        name = stem + ext
+    return os.path.join(_get_tmp_dir(), prefix + name)
+
+
 class WechatKfMessage(ChatMessage):
     """
     msg structure (from cgi-bin/kf/sync_msg):
@@ -119,10 +148,12 @@ class WechatKfMessage(ChatMessage):
                     # upload, so it can carry a separator ("sub/x.pdf",
                     # "../../x.txt") and stop being one path component; reduce
                     # it first, like weixin, slack, discord, qq and dingtalk do.
-                    filename = safe_filename(
-                        _extract_filename(response.headers.get("Content-Disposition", ""))
-                    ) or media_id
-                    save_path = os.path.join(_get_tmp_dir(), filename)
+                    # Prefix the media id too, so two attachments sharing the
+                    # sender-chosen name cannot clobber each other.
+                    filename = _extract_filename(
+                        response.headers.get("Content-Disposition", "")
+                    )
+                    save_path = _unique_save_path(media_id, filename)
                     try:
                         save_response(response, save_path, MAX_FILE_BYTES)
                     except Exception as e:
